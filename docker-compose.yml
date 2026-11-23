@@ -66,8 +66,8 @@ services:
       - --collation-server=utf8mb4_unicode_ci
       - --default-time-zone=+08:00
     ports:
-      # 只绑定本机，供 npm run dev:backend 直连；生产环境可以删掉这两行
-      - "127.0.0.1:3306:3306"
+      # 只绑定本机，供 npm run dev:backend 直连；生产主机已有 MySQL 时可通过 MYSQL_PORT 换端口。
+      - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
