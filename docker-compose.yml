@@ -1,0 +1,248 @@
+# 一键部署：前端 + 后端 + MySQL + nginx 反向代理
+#
+#   1) cp .env.docker.example .env    # 填好 JWT_SECRET、数据库密码等
+#   2) docker compose up -d --build
+#   3) 打开 http://localhost:8080
+#
+# 只想起开发用的数据库（配合 npm run dev:backend）：
+#   docker compose up -d mysql
+
+name: campus-lostfound
+
+# 所有容器的日志轮转
+# Docker 默认的 json-file 驱动不限制大小，长期运行会把磁盘写满（真实事故常客）。
+# 每个容器最多保留 3 个 10MB 文件，超出自动滚动删除。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# 常驻后端与迁移服务共用的环境变量。管理员初始化凭据不放在这个锚点内。
+x-backend-env: &backend-env
+  NODE_ENV: production
+  PORT: "3000"
+  DATABASE_URL: mysql://${MYSQL_USER:?MYSQL_USER is required}:${MYSQL_PASSWORD:?MYSQL_PASSWORD is required}@mysql:3306/${MYSQL_DATABASE:?MYSQL_DATABASE is required}
+  JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+  JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
+  ADMIN_SESSION_COOKIE: ${ADMIN_SESSION_COOKIE:-admin_session}
+  ADMIN_CSRF_COOKIE: ${ADMIN_CSRF_COOKIE:-admin_csrf}
+  ADMIN_SESSION_TTL_MINUTES: ${ADMIN_SESSION_TTL_MINUTES:-480}
+  ADMIN_COOKIE_SECURE: ${ADMIN_COOKIE_SECURE:-true}
+  PUBLIC_QUERY_TTL_DAYS: ${PUBLIC_QUERY_TTL_DAYS:-30}
+  REQUIRE_REVIEW: ${REQUIRE_REVIEW:-false}
+  ENABLE_WHITELIST: ${ENABLE_WHITELIST:-false}
+  STUDENT_NO_REGEX: '${STUDENT_NO_REGEX:-^\d{8,12}$}'
+  # 容器内固定路径，与下方 volume 对应
+  UPLOAD_DIR: /app/uploads
+  PRIVATE_UPLOAD_DIR: /app/private-uploads
+  AUDIT_LOG_RETENTION_DAYS: ${AUDIT_LOG_RETENTION_DAYS:-365}
+  PUBLIC_SITE_URL: ${PUBLIC_SITE_URL:-}
+  # 同域部署（nginx 反代）时不需要跨域白名单
+  CORS_ORIGINS: ${CORS_ORIGINS:-}
+  # 项目内 nginx 算一层；若外层还有 Caddy、Cloudflare 等代理，需要相应增加。
+  TRUST_PROXY: ${TRUST_PROXY:-1}
+  RATE_LIMIT_WINDOW_MS: ${RATE_LIMIT_WINDOW_MS:-900000}
+  RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-600}
+  ENABLE_API_DOCS: ${ENABLE_API_DOCS:-false}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  TZ: Asia/Shanghai
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: campus-lostfound-mysql
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is required}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:?MYSQL_DATABASE is required}
+      MYSQL_USER: ${MYSQL_USER:?MYSQL_USER is required}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD is required}
+      TZ: Asia/Shanghai
+    # 中文内容必须 utf8mb4，否则 emoji 与生僻字会被截断
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+08:00
+    ports:
+      # 只绑定本机，供 npm run dev:backend 直连；生产环境可以删掉这两行
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # 一次性迁移任务；backend 等迁移成功后才启动。
+  migrate:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: build
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment: *backend-env
+    command:
+      - sh
+      - -c
+      - npx prisma migrate deploy --schema ./backend/prisma/schema.prisma
+    restart: "no"
+    logging: *default-logging
+
+  # 显式一次性初始化；使用 --rm 运行，管理员密码不会留在常驻容器配置中。
+  #   docker compose --profile ops run --rm seed
+  seed:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: build
+    profiles: ["ops"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *backend-env
+      ADMIN_STUDENT_NO: ${ADMIN_STUDENT_NO:-}
+      ADMIN_NAME: ${ADMIN_NAME:-系统管理员}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+    command: ["node", "backend/prisma/seed.js"]
+    restart: "no"
+    logging: *default-logging
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    container_name: campus-lostfound-backend
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      mysql:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment: *backend-env
+    volumes:
+      # 上传的图片持久化：容器重建不丢图
+      - uploads_data:/app/uploads
+      - private_uploads_data:/app/private-uploads
+    expose:
+      - "3000"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: campus-lostfound-frontend
+    restart: unless-stopped
+    logging: *default-logging
+    expose:
+      - "80"
+
+  nginx:
+    image: nginx:alpine
+    container_name: campus-lostfound-nginx
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      backend:
+        condition: service_started
+      frontend:
+        condition: service_started
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # 备份任务（不随 up 启动，用 profile 单独触发）
+  #   docker compose --profile ops run --rm backup
+  backup:
+    image: mysql:8.4
+    logging: *default-logging
+    profiles: ["ops"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+      - ./backups:/backups
+      - uploads_data:/source/uploads:ro
+      - private_uploads_data:/source/private-uploads:ro
+    environment:
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: ${MYSQL_DATABASE:-campus_lostfound}
+      DB_USER: ${MYSQL_USER:-campus}
+      # 用 MYSQL_PWD 传密码，避免出现在命令行参数与容器进程列表里
+      MYSQL_PWD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD is required}
+      BACKUP_DIR: /backups
+      BACKUP_KEEP: "7"
+    entrypoint: ["/bin/sh", "/scripts/backup-db.sh"]
+
+  restore-check:
+    image: mysql:8.4
+    logging: *default-logging
+    profiles: ["ops"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+      - ./backups:/backups:ro
+    environment:
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: ${MYSQL_DATABASE:-campus_lostfound}
+      DB_USER: root
+      MYSQL_PWD: ${MYSQL_ROOT_PASSWORD:-}
+      BACKUP_FILE: ${BACKUP_FILE:-}
+      UPLOADS_BACKUP_FILE: ${UPLOADS_BACKUP_FILE:-}
+      PRIVATE_UPLOADS_BACKUP_FILE: ${PRIVATE_UPLOADS_BACKUP_FILE:-}
+      RESTORE_TEST_DB: ${RESTORE_TEST_DB:-campus_lostfound_restore_check}
+    entrypoint: ["/bin/sh", "/scripts/restore-check.sh"]
+
+  maintenance:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    profiles: ["ops"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment: *backend-env
+    command: ["node", "scripts/maintenance.js"]
+    restart: "no"
+    logging: *default-logging
+
+volumes:
+  # 显式命名，避免 compose 项目名变化导致「数据看起来丢了」
+  mysql_data:
+    name: campus-lostfound_mysql-data
+  uploads_data:
+    name: campus-lostfound_uploads
+  private_uploads_data:
+    name: campus-lostfound_private-uploads

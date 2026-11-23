@@ -1,0 +1,567 @@
+// 校园失物招领 —— 数据模型
+// 数据库：MySQL 8（本地开发由根目录 docker-compose.yml 提供）
+// 约定：字段名在 JS 里用 camelCase，在库里用 snake_case，便于直接用 SQL 排查问题。
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ============ 枚举 ============
+
+/// 角色：学生 / 管理员
+enum Role {
+  student
+  admin
+}
+
+/// 账号状态：正常 / 封禁
+enum UserStatus {
+  active
+  banned
+}
+
+/// 帖子类型：lost=寻物（我丢了东西），found=招领（我捡到东西）
+enum ItemType {
+  lost
+  found
+}
+
+/// 帖子状态：
+/// pending  待审核（REQUIRE_REVIEW=true 时的初始状态，仅作者/管理员可见）
+/// open     进行中（发布即上线时为初始状态）
+/// resolved 已找回 / 已解决
+/// rejected 审核未通过
+/// offline  被管理员下架
+enum ItemStatus {
+  pending
+  open
+  resolved
+  cleaned
+  rejected
+  offline
+}
+
+/// 失物匹配建议的管理员决策状态。
+enum LostFoundMatchStatus {
+  suggested
+  confirmed
+  ignored
+}
+
+/// 联系方式类型
+enum ContactType {
+  wechat
+  qq
+  phone
+  other
+}
+
+/// 举报处理状态
+enum ReportStatus {
+  pending
+  handled
+}
+
+/// 官网内容状态：草稿 / 待审核 / 已发布 / 已驳回 / 已归档 / 已删除
+enum SiteContentStatus {
+  draft
+  pending_review
+  published
+  rejected
+  archived
+  deleted
+}
+
+/// 游客投稿方式
+enum SubmissionMode {
+  anonymous
+  signed
+}
+
+/// 游客投稿处理状态
+enum SubmissionStatus {
+  pending_review
+  approved
+  rejected
+  processing
+  processed
+  archived
+  deleted
+}
+
+/// 官网媒体类型和公开范围
+enum SiteMediaKind {
+  image
+  attachment
+}
+
+enum SiteMediaVisibility {
+  public
+  private
+  admin_only
+}
+
+enum SiteCategoryKind {
+  news
+  mailbox
+  canteen
+}
+
+// ============ 用户 ============
+
+model User {
+  id           Int        @id @default(autoincrement())
+  /// 学号：全站唯一，8 位纯数字（格式由 STUDENT_NO_REGEX 控制）
+  studentNo    String     @unique @map("student_no") @db.VarChar(20)
+  name         String     @db.VarChar(30)
+  /// 仅存 bcrypt 哈希，任何接口都不得返回该字段
+  passwordHash String     @map("password_hash") @db.VarChar(100)
+  role         Role       @default(student)
+  status       UserStatus @default(active)
+  createdAt    DateTime   @default(now()) @map("created_at")
+  lastLoginAt  DateTime?  @map("last_login_at")
+
+  items          Item[]
+  reports        Report[]         @relation("ReportReporter")
+  handledReports Report[]         @relation("ReportHandler")
+  auditLogs      AuditLog[]
+  adminSessions  AdminSession[]
+  matchDecisions LostFoundMatch[]
+
+  @@map("users")
+}
+
+/// 管理员服务端会话。只保存随机会话令牌的 SHA-256，不保存原始 Cookie 值。
+model AdminSession {
+  id            Int       @id @default(autoincrement())
+  adminId       Int       @map("admin_id")
+  tokenHash     String    @unique @map("token_hash") @db.Char(64)
+  csrfTokenHash String    @map("csrf_token_hash") @db.Char(64)
+  expiresAt     DateTime  @map("expires_at")
+  revokedAt     DateTime? @map("revoked_at")
+  lastUsedAt    DateTime? @map("last_used_at")
+  ipHash        String?   @map("ip_hash") @db.Char(64)
+  userAgent     String?   @map("user_agent") @db.VarChar(255)
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  admin User @relation(fields: [adminId], references: [id], onDelete: Cascade)
+
+  @@index([adminId, revokedAt])
+  @@index([expiresAt])
+  @@map("admin_sessions")
+}
+
+// ============ 分类 ============
+
+model Category {
+  id        Int     @id @default(autoincrement())
+  name      String  @unique @db.VarChar(30)
+  sortOrder Int     @default(0) @map("sort_order")
+  /// 停用的分类不再出现在发布页，但历史帖子仍可展示
+  enabled   Boolean @default(true)
+
+  items Item[]
+
+  @@map("categories")
+}
+
+// ============ 失物帖子 ============
+
+model Item {
+  id            Int          @id @default(autoincrement())
+  /// 游客投稿没有账号；历史登录用户记录仍保留 userId。
+  userId        Int?         @map("user_id")
+  type          ItemType
+  title         String       @db.VarChar(60)
+  description   String       @db.Text
+  categoryId    Int          @map("category_id")
+  /// 丢失/拾取地点，如「图书馆三楼自习区」
+  location      String       @db.VarChar(100)
+  /// 丢失/拾取发生时间（用户自述，允许早于发布时间）
+  happenedAt    DateTime     @map("happened_at")
+  /// 公开检索区域（A/B/D），旧数据可为空
+  area          String?      @db.VarChar(1)
+  /// 面向公开台账的编号，旧数据可为空，非空时唯一
+  itemNo        String?      @unique @map("item_no") @db.VarChar(40)
+  /// 公开特征字段；旧数据回退使用 description
+  features      String?      @db.Text
+  /// 管理员可以撤回公开展示，但保留内部记录
+  publicAllowed Boolean      @default(true) @map("public_allowed")
+  contactType   ContactType? @map("contact_type")
+  /// 联系方式原文，只对已登录用户返回
+  contactValue  String?      @map("contact_value") @db.VarChar(100)
+  status        ItemStatus   @default(open)
+  /// 审核驳回原因（仅 status=rejected 时有值）
+  rejectReason  String?      @map("reject_reason") @db.VarChar(200)
+  /// 管理员内部备注，永不进入公开 DTO
+  internalNote  String?      @map("internal_note") @db.Text
+  viewCount     Int          @default(0) @map("view_count")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
+  /// 标记「已找回/已解决」的时间
+  resolvedAt    DateTime?    @map("resolved_at")
+
+  // 用户不做物理删除（只封禁），因此用 Restrict 防止误删导致帖子悬空
+  user     User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  // 分类下仍有帖子时禁止删除分类，必须先把帖子迁移到其他分类
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  images        ItemImage[]
+  reports       Report[]
+  inquiries     LostFoundInquiry[]
+  sourceMatches LostFoundMatch[]   @relation("LostFoundMatchSource")
+  targetMatches LostFoundMatch[]   @relation("LostFoundMatchTarget")
+
+  /// 仅游客报失/拾物登记使用；旧登录用户记录保持为空。
+  queryNo             String?   @unique @map("query_no") @db.VarChar(32)
+  queryCredentialHash String?   @map("query_credential_hash") @db.Char(64)
+  idempotencyKeyHash  String?   @map("idempotency_key_hash") @db.Char(64)
+  contentFingerprint  String?   @map("content_fingerprint") @db.Char(64)
+  attachments         Json?
+  submittedAt         DateTime  @default(now()) @map("submitted_at")
+  queryExpiresAt      DateTime? @map("query_expires_at")
+  deletedAt           DateTime? @map("deleted_at")
+
+  @@unique([idempotencyKeyHash])
+  // 列表页高频筛选/排序字段
+  @@index([status])
+  @@index([type])
+  @@index([categoryId])
+  @@index([area])
+  @@index([publicAllowed])
+  @@index([createdAt])
+  // 「我的发布」与「每日发布额度」都按 (userId, createdAt) 过滤，
+  // 复合索引同时覆盖这两种查询，因此不再单独建 userId 索引
+  @@index([userId, createdAt])
+  @@index([contentFingerprint, submittedAt])
+  @@index([type, area, status, happenedAt])
+  @@index([categoryId, happenedAt])
+  @@map("items")
+}
+
+/// 管理员审核的失物匹配建议/人工关联记录。
+model LostFoundMatch {
+  id           Int                  @id @default(autoincrement())
+  sourceItemId Int                  @map("source_item_id")
+  targetItemId Int                  @map("target_item_id")
+  score        Int                  @default(0)
+  reasons      Json
+  status       LostFoundMatchStatus @default(suggested)
+  decisionNote String?              @map("decision_note") @db.VarChar(500)
+  decidedBy    Int?                 @map("decided_by")
+  createdAt    DateTime             @default(now()) @map("created_at")
+  updatedAt    DateTime             @updatedAt @map("updated_at")
+
+  source Item  @relation("LostFoundMatchSource", fields: [sourceItemId], references: [id], onDelete: Cascade)
+  target Item  @relation("LostFoundMatchTarget", fields: [targetItemId], references: [id], onDelete: Cascade)
+  admin  User? @relation(fields: [decidedBy], references: [id], onDelete: SetNull)
+
+  @@unique([sourceItemId, targetItemId])
+  @@index([sourceItemId, status, score])
+  @@index([targetItemId, status, score])
+  @@map("lost_found_matches")
+}
+
+// ============ 官网公开内容 ============
+
+/// 部门概况。profileKey 固定为 main，保留单例约束。
+model DepartmentProfile {
+  id           Int               @id @default(autoincrement())
+  profileKey   String            @unique @map("profile_key") @db.VarChar(32)
+  history      String            @db.Text
+  organization String            @db.Text
+  spirit       String            @db.Text
+  logoMediaId  Int?              @unique @map("logo_media_id")
+  status       SiteContentStatus @default(draft)
+  publishedAt  DateTime?         @map("published_at")
+  updatedBy    Int?              @map("updated_by")
+  createdAt    DateTime          @default(now()) @map("created_at")
+  updatedAt    DateTime          @updatedAt @map("updated_at")
+  deletedAt    DateTime?         @map("deleted_at")
+
+  logo SiteMedia? @relation("DepartmentLogo", fields: [logoMediaId], references: [id], onDelete: SetNull)
+
+  @@index([status, publishedAt])
+  @@map("department_profiles")
+}
+
+/// 工作动态 / 活动新闻。
+model News {
+  id           Int               @id @default(autoincrement())
+  slug         String            @unique @db.VarChar(160)
+  title        String            @db.VarChar(120)
+  categoryId   Int?              @map("category_id")
+  summary      String            @db.VarChar(500)
+  body         String            @db.LongText
+  coverMediaId Int?              @unique @map("cover_media_id")
+  status       SiteContentStatus @default(draft)
+  publishedAt  DateTime?         @map("published_at")
+  createdBy    Int?              @map("created_by")
+  createdAt    DateTime          @default(now()) @map("created_at")
+  updatedAt    DateTime          @updatedAt @map("updated_at")
+  deletedAt    DateTime?         @map("deleted_at")
+
+  category SiteCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  cover    SiteMedia?    @relation("NewsCover", fields: [coverMediaId], references: [id], onDelete: SetNull)
+
+  @@index([status, publishedAt])
+  @@index([categoryId, publishedAt])
+  @@map("news")
+}
+
+/// 食堂面对面月报。
+model CanteenMonthlyReport {
+  id              Int               @id @default(autoincrement())
+  reportMonth     DateTime          @map("report_month") @db.Date
+  surveySummary   String            @map("survey_summary") @db.LongText
+  feedbackSummary String            @map("feedback_summary") @db.LongText
+  status          SiteContentStatus @default(draft)
+  publishedAt     DateTime?         @map("published_at")
+  createdBy       Int?              @map("created_by")
+  createdAt       DateTime          @default(now()) @map("created_at")
+  updatedAt       DateTime          @updatedAt @map("updated_at")
+  deletedAt       DateTime?         @map("deleted_at")
+
+  photos CanteenReportMedia[]
+
+  @@unique([reportMonth])
+  @@index([status, reportMonth])
+  @@map("canteen_monthly_reports")
+}
+
+/// 食堂意见。写入接口在游客投稿阶段使用，公开读取只返回明确允许公开的记录。
+model CanteenFeedback {
+  id                  Int              @id @default(autoincrement())
+  reportMonth         DateTime?        @map("report_month") @db.Date
+  submitMode          SubmissionMode   @map("submit_mode")
+  className           String?          @map("class_name") @db.VarChar(80)
+  name                String?          @db.VarChar(80)
+  contactType         ContactType?     @map("contact_type")
+  contactValue        String?          @map("contact_value") @db.VarChar(160)
+  content             String           @db.Text
+  attachments         Json?
+  status              SubmissionStatus @default(pending_review)
+  publicAllowed       Boolean          @default(false) @map("public_allowed")
+  publicContent       String?          @map("public_content") @db.Text
+  adminReply          String?          @map("admin_reply") @db.Text
+  internalNote        String?          @map("internal_note") @db.Text
+  queryNo             String           @unique @map("query_no") @db.VarChar(32)
+  queryCredentialHash String?          @map("query_credential_hash") @db.Char(64)
+  idempotencyKeyHash  String?          @map("idempotency_key_hash") @db.Char(64)
+  contentFingerprint  String?          @map("content_fingerprint") @db.Char(64)
+  submittedAt         DateTime         @default(now()) @map("submitted_at")
+  queryExpiresAt      DateTime?        @map("query_expires_at")
+  processedAt         DateTime?        @map("processed_at")
+  createdAt           DateTime         @default(now()) @map("created_at")
+  updatedAt           DateTime         @updatedAt @map("updated_at")
+  deletedAt           DateTime?        @map("deleted_at")
+
+  @@unique([idempotencyKeyHash])
+  @@index([status, submittedAt])
+  @@index([publicAllowed, status, reportMonth])
+  @@index([contentFingerprint, submittedAt])
+  @@map("canteen_feedback")
+}
+
+/// 对公开失物记录的游客线索。
+model LostFoundInquiry {
+  id                  Int              @id @default(autoincrement())
+  itemId              Int              @map("item_id")
+  message             String           @db.Text
+  attachments         Json?
+  contactType         ContactType?     @map("contact_type")
+  contactValue        String?          @map("contact_value") @db.VarChar(160)
+  status              SubmissionStatus @default(pending_review)
+  adminReply          String?          @map("admin_reply") @db.Text
+  internalNote        String?          @map("internal_note") @db.Text
+  queryNo             String           @unique @map("query_no") @db.VarChar(32)
+  queryCredentialHash String?          @map("query_credential_hash") @db.Char(64)
+  idempotencyKeyHash  String?          @map("idempotency_key_hash") @db.Char(64)
+  contentFingerprint  String?          @map("content_fingerprint") @db.Char(64)
+  submittedAt         DateTime         @default(now()) @map("submitted_at")
+  queryExpiresAt      DateTime?        @map("query_expires_at")
+  processedAt         DateTime?        @map("processed_at")
+  createdAt           DateTime         @default(now()) @map("created_at")
+  updatedAt           DateTime         @updatedAt @map("updated_at")
+  deletedAt           DateTime?        @map("deleted_at")
+
+  item Item @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@unique([idempotencyKeyHash])
+  @@index([itemId, status])
+  @@index([status, submittedAt])
+  @@index([contentFingerprint, submittedAt])
+  @@map("lost_found_inquiries")
+}
+
+/// 学生信箱投稿。
+model MailboxMessage {
+  id                  Int              @id @default(autoincrement())
+  submitMode          SubmissionMode   @map("submit_mode")
+  className           String?          @map("class_name") @db.VarChar(80)
+  name                String?          @db.VarChar(80)
+  contactType         ContactType?     @map("contact_type")
+  contactValue        String?          @map("contact_value") @db.VarChar(160)
+  subject             String           @db.VarChar(160)
+  categoryId          Int?             @map("category_id")
+  content             String           @db.Text
+  attachments         Json?
+  publicAllowed       Boolean          @default(false) @map("public_allowed")
+  publicContent       String?          @map("public_content") @db.Text
+  adminReply          String?          @map("admin_reply") @db.Text
+  internalNote        String?          @map("internal_note") @db.Text
+  status              SubmissionStatus @default(pending_review)
+  queryNo             String           @unique @map("query_no") @db.VarChar(32)
+  queryCredentialHash String?          @map("query_credential_hash") @db.Char(64)
+  idempotencyKeyHash  String?          @map("idempotency_key_hash") @db.Char(64)
+  contentFingerprint  String?          @map("content_fingerprint") @db.Char(64)
+  submittedAt         DateTime         @default(now()) @map("submitted_at")
+  queryExpiresAt      DateTime?        @map("query_expires_at")
+  processedAt         DateTime?        @map("processed_at")
+  createdAt           DateTime         @default(now()) @map("created_at")
+  updatedAt           DateTime         @updatedAt @map("updated_at")
+  deletedAt           DateTime?        @map("deleted_at")
+
+  category SiteCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  @@unique([idempotencyKeyHash])
+  @@index([status, submittedAt])
+  @@index([publicAllowed, status, submittedAt])
+  @@index([categoryId])
+  @@index([contentFingerprint, submittedAt])
+  @@map("mailbox_messages")
+}
+
+/// 官网独立分类，避免与旧失物分类混用。
+model SiteCategory {
+  id        Int              @id @default(autoincrement())
+  kind      SiteCategoryKind
+  name      String           @db.VarChar(50)
+  slug      String           @db.VarChar(80)
+  sortOrder Int              @default(0) @map("sort_order")
+  enabled   Boolean          @default(true)
+  createdAt DateTime         @default(now()) @map("created_at")
+  updatedAt DateTime         @updatedAt @map("updated_at")
+
+  news    News[]
+  mailbox MailboxMessage[]
+
+  @@unique([kind, name])
+  @@unique([kind, slug])
+  @@index([kind, enabled, sortOrder])
+  @@map("site_categories")
+}
+
+/// 官网媒体元数据。实际文件仍存放在 UPLOAD_DIR。
+model SiteMedia {
+  id         Int                 @id @default(autoincrement())
+  url        String              @db.VarChar(255)
+  altText    String              @map("alt_text") @db.VarChar(255)
+  mimeType   String              @map("mime_type") @db.VarChar(100)
+  kind       SiteMediaKind
+  visibility SiteMediaVisibility @default(private)
+  byteSize   Int                 @map("byte_size")
+  width      Int?
+  height     Int?
+  sha256     String              @db.Char(64)
+  uploadedBy Int?                @map("uploaded_by")
+  createdAt  DateTime            @default(now()) @map("created_at")
+  deletedAt  DateTime?           @map("deleted_at")
+
+  newsCover          News?                @relation("NewsCover")
+  departmentProfiles DepartmentProfile[]  @relation("DepartmentLogo")
+  reports            CanteenReportMedia[]
+
+  @@index([visibility, kind])
+  @@index([createdAt])
+  @@map("site_media")
+}
+
+model CanteenReportMedia {
+  reportId  Int @map("report_id")
+  mediaId   Int @map("media_id")
+  sortOrder Int @default(0) @map("sort_order")
+
+  report CanteenMonthlyReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  media  SiteMedia            @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+
+  @@id([reportId, mediaId])
+  @@index([reportId, sortOrder])
+  @@map("canteen_report_media")
+}
+
+// ============ 帖子图片 ============
+
+model ItemImage {
+  id        Int    @id @default(autoincrement())
+  itemId    Int    @map("item_id")
+  /// 相对路径，如 /uploads/2025/05/xxxx.webp，不存绝对域名
+  url       String @db.VarChar(255)
+  sortOrder Int    @default(0) @map("sort_order")
+
+  item Item @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@index([itemId])
+  @@map("item_images")
+}
+
+// ============ 举报 ============
+
+model Report {
+  id         Int          @id @default(autoincrement())
+  itemId     Int          @map("item_id")
+  reporterId Int          @map("reporter_id")
+  reason     String       @db.VarChar(200)
+  status     ReportStatus @default(pending)
+  /// 处理人（管理员），未处理时为空
+  handledBy  Int?         @map("handled_by")
+  createdAt  DateTime     @default(now()) @map("created_at")
+
+  item     Item  @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  reporter User  @relation("ReportReporter", fields: [reporterId], references: [id], onDelete: Restrict)
+  handler  User? @relation("ReportHandler", fields: [handledBy], references: [id], onDelete: SetNull)
+
+  // 同一用户对同一帖子只能举报一次，用数据库唯一约束兜住并发重复提交
+  @@unique([itemId, reporterId])
+  @@index([itemId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("reports")
+}
+
+// ============ 学号白名单（ENABLE_WHITELIST=true 时生效） ============
+
+model StudentWhitelist {
+  id        Int    @id @default(autoincrement())
+  studentNo String @unique @map("student_no") @db.VarChar(20)
+  name      String @db.VarChar(30)
+
+  @@map("student_whitelist")
+}
+
+// ============ 管理操作审计日志 ============
+
+model AuditLog {
+  id         Int      @id @default(autoincrement())
+  /// 操作人。为空表示系统任务（如 90 天自动归档），不是人为操作
+  adminId    Int?     @map("admin_id")
+  /// 动作标识，如 item.offline / user.ban / report.handle / system.archive
+  action     String   @db.VarChar(50)
+  /// 目标类型，如 item / user / report / category
+  targetType String   @map("target_type") @db.VarChar(30)
+  targetId   Int?     @map("target_id")
+  /// 结构化明细（改前/改后、理由等）
+  detail     Json?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  admin User? @relation(fields: [adminId], references: [id], onDelete: SetNull)
+
+  @@index([adminId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}

@@ -1,0 +1,1361 @@
+openapi: 3.0.3
+info:
+  title: 校园失物招领 API
+  version: 1.0.0
+  description: |
+    学校部门官网与失物招领网站的后端接口。
+
+    **统一响应格式**：所有接口都返回 `{ code, message, data }`，`code = 0` 表示成功。
+    HTTP 状态码与业务错误码配合使用：`40001` 参数错误、`40101` 未登录、`40301` 无权限、
+    `40401` 不存在、`41001` 查询已过期、`40901` 冲突、`42901` 限流、`50001` 服务端错误。
+
+    **身份模型**：公开接口全部按 guest 访问，无注册、游客登录或个人中心。后台使用 `/admin/auth/login` 签发服务端 HttpOnly 会话 Cookie；写请求还需 `X-CSRF-Token`。管理员初始账号只由环境变量和一次性 seed 创建。
+
+    **隐私约定**：
+    - 公开官网接口只返回已发布且允许公开的数据；联系方式、内部备注、查询凭证和管理员字段不会进入公开 DTO。
+    - 游客投稿使用一次性查询编号和查询凭证，不创建账号。
+
+    **限流**：全局限流按 IP 计（默认 15 分钟 600 次）；登录接口另有「15 分钟最多 10 次密码错误」的独立限制。
+servers:
+  - url: http://localhost:3000/api
+    description: 本地开发
+  - url: /api
+    description: 生产（nginx 同域反代）
+tags:
+  - name: 认证
+  - name: 帖子
+  - name: 我的
+  - name: 分类
+  - name: 上传
+  - name: 后台-概览
+  - name: 后台-内容
+  - name: 后台-用户
+  - name: 后台-举报
+  - name: 后台-分类
+  - name: 后台-名单
+  - name: 运维
+
+security:
+  - bearerAuth: []
+
+paths:
+  /admin/auth/login:
+    post:
+      tags: [认证]
+      summary: 管理员登录
+      description: 使用环境变量初始化的唯一管理员账号登录，成功后签发 HttpOnly 会话 Cookie 和 CSRF Cookie。游客账号、注册和密码找回不属于本系统。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [studentNo, password]
+              properties:
+                studentNo: { type: string, minLength: 1, maxLength: 32 }
+                password: { type: string, minLength: 1, maxLength: 128, format: password }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /public/news:
+    get:
+      tags: [官网公开内容]
+      summary: 已发布工作动态列表
+      description: 只返回已发布且允许公开的工作动态，不需要游客登录。
+      security: []
+      parameters:
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: pageSize, schema: { type: integer, minimum: 1, maximum: 50, default: 12 } }
+        - { in: query, name: categoryId, schema: { type: integer } }
+        - { in: query, name: from, schema: { type: string, format: date } }
+        - { in: query, name: to, schema: { type: string, format: date } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+
+  /public/lost-found:
+    get:
+      tags: [官网公开内容]
+      summary: 公开失物招领检索
+      description: |
+        只返回 `publicAllowed=true`、未删除且状态为 `open` 或 `resolved` 的记录。
+        联系方式、管理员内部备注、投稿人信息和审核字段不会进入响应。
+        `dateFrom`/`dateTo` 按发生时间筛选，结束日期包含当天 23:59:59。
+      security: []
+      parameters:
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: pageSize, schema: { type: integer, minimum: 1, maximum: 50, default: 12 } }
+        - { in: query, name: keyword, schema: { type: string, maxLength: 50 }, description: 标题、描述、地点、特征或编号 }
+        - { in: query, name: area, schema: { type: string, enum: [A, B, D] } }
+        - { in: query, name: type, schema: { type: string, enum: [lost, found] } }
+        - { in: query, name: categoryId, schema: { type: integer, minimum: 1 } }
+        - { in: query, name: itemNo, schema: { type: string, maxLength: 40 } }
+        - { in: query, name: features, schema: { type: string, maxLength: 100 } }
+        - { in: query, name: status, schema: { type: string, enum: [open, resolved, published, claimed_returned, cleaned] } }
+        - { in: query, name: dateFrom, schema: { type: string, format: date-time } }
+        - { in: query, name: dateTo, schema: { type: string, format: date-time } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+
+  /public/lost-found/{id}:
+    get:
+      tags: [官网公开内容]
+      summary: 公开失物详情
+      security: []
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ================= 认证 =================
+  # 游客没有注册、登录和个人中心；管理员登录接口见运行时路由 /admin/auth/*。
+
+  # ================= 帖子 =================
+  /items:
+    get:
+      tags: [帖子]
+      summary: 帖子列表（公开）
+      description: |
+        只返回状态为 `open` / `resolved` 的帖子，按发布时间倒序。
+        **不返回联系方式**，每项带 `hasContact` 标记。
+      security: []
+      parameters:
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 }, description: 页码 }
+        - { in: query, name: pageSize, schema: { type: integer, minimum: 1, maximum: 50, default: 12 }, description: 每页条数 }
+        - { in: query, name: type, schema: { type: string, enum: [lost, found] }, description: lost=寻物，found=招领 }
+        - { in: query, name: categoryId, schema: { type: integer }, description: 分类 id }
+        - { in: query, name: status, schema: { type: string, enum: [open, resolved] }, description: 只能传公开状态 }
+        - { in: query, name: keyword, schema: { type: string, maxLength: 50 }, description: 标题 / 描述 / 地点模糊搜索 }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          list:
+                            type: array
+                            items: { $ref: '#/components/schemas/ItemSummary' }
+                          pagination: { $ref: '#/components/schemas/Pagination' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+
+    post:
+      tags: [帖子]
+      summary: 发布帖子
+      description: |
+        每人每天最多 10 条（按东八区零点重置），超限返回 429。
+        初始状态由 `REQUIRE_REVIEW` 决定：false → `open`（发布即上线），true → `pending`。
+        图片必须是 `/api/upload` 返回的地址且文件真实存在。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, title, description, categoryId, location, happenedAt, contactType, contactValue, images]
+              properties:
+                type: { type: string, enum: [lost, found] }
+                title: { type: string, minLength: 2, maxLength: 60 }
+                description: { type: string, minLength: 5, maxLength: 2000 }
+                categoryId: { type: integer }
+                location: { type: string, minLength: 2, maxLength: 100 }
+                happenedAt:
+                  type: string
+                  format: date-time
+                  description: 丢失/拾取时间，不能晚于当前时间
+                contactType: { type: string, enum: [wechat, qq, phone, other] }
+                contactValue:
+                  type: string
+                  minLength: 2
+                  maxLength: 100
+                  description: phone 需为 11 位手机号；qq 需为 5-12 位数字
+                images:
+                  type: array
+                  minItems: 1
+                  maxItems: 5
+                  items: { type: string, example: /uploads/2026/10/0d23a0c6...webp }
+            example:
+              type: found
+              title: 捡到一张校园卡
+              description: 在图书馆二楼自助借还机旁边捡到的，卡套是蓝色的
+              categoryId: 1
+              location: 图书馆二楼
+              happenedAt: '2026-10-23T06:00:00.000Z'
+              contactType: wechat
+              contactValue: wx_abc123
+              images: ['/uploads/2026/10/0d23a0c6c608d5167bcbcef14044b46c8f.webp']
+      responses:
+        '201':
+          description: 发布成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ItemDetail' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /items/{id}:
+    get:
+      tags: [帖子]
+      summary: 帖子详情
+      description: |
+        浏览数原子 +1。联系方式仅在携带有效 token 时返回。
+        非公开状态（pending / rejected / offline）只有作者本人与管理员可见，其他人一律 404。
+      security:
+        - bearerAuth: []
+        - {}
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer } }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ItemDetail' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+    put:
+      tags: [帖子]
+      summary: 编辑帖子（仅作者）
+      description: |
+        字段均可选。两个约束：联系方式必须成对提交；
+        只有 `open` / `rejected` 状态可编辑，其他状态返回 409。
+        提交 `images` 会整组替换。开启审核时编辑后状态回到 `pending`。
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                type: { type: string, enum: [lost, found] }
+                title: { type: string, minLength: 2, maxLength: 60 }
+                description: { type: string, minLength: 5, maxLength: 2000 }
+                categoryId: { type: integer }
+                location: { type: string, minLength: 2, maxLength: 100 }
+                happenedAt: { type: string, format: date-time }
+                contactType: { type: string, enum: [wechat, qq, phone, other] }
+                contactValue: { type: string }
+                images: { type: array, minItems: 1, maxItems: 5, items: { type: string } }
+      responses:
+        '200':
+          description: 保存成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ItemDetail' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+    delete:
+      tags: [帖子]
+      summary: 删除帖子（仅作者）
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /items/{id}/resolve:
+    patch:
+      tags: [帖子]
+      summary: 标记已找回（仅作者）
+      description: 只有 `open` 状态可以标记；已标记过返回 409。
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /items/{id}/report:
+    post:
+      tags: [帖子]
+      summary: 举报帖子
+      description: 同一用户对同一帖子只能举报一次，重复举报返回 409。
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 2, maxLength: 200, example: 疑似重复发布 }
+      responses:
+        '201': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ================= 我的 =================
+  /me/items:
+    get:
+      tags: [我的]
+      summary: 我的发布（含全部状态）
+      parameters:
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: pageSize, schema: { type: integer, maximum: 50, default: 12 } }
+        - { in: query, name: type, schema: { type: string, enum: [lost, found] } }
+        - { in: query, name: status, schema: { type: string, enum: [pending, open, resolved, cleaned, rejected, offline] } }
+      responses:
+        '200':
+          description: 成功（本人可见联系方式与驳回原因）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          list:
+                            type: array
+                            items: { $ref: '#/components/schemas/ItemDetail' }
+                          pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ================= 分类 =================
+  /categories:
+    get:
+      tags: [分类]
+      summary: 分类列表（公开，仅启用的）
+      security: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Category' }
+
+  # ================= 上传 =================
+  /upload:
+    post:
+      tags: [上传]
+      summary: 上传图片
+      description: |
+        仅支持 jpg / png / webp，单张 ≤5MB。服务端会按 EXIF 摆正、
+        把最长边压到 1280px 并转成 webp，文件名随机化。
+        真正的内容类型由 sharp 解析判定，不信客户端声明的 mimetype。
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image: { type: string, format: binary }
+      responses:
+        '201':
+          description: 上传成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          url: { type: string, example: /uploads/2026/10/0d23a0c6...webp }
+                          width: { type: integer, example: 1280 }
+                          height: { type: integer, example: 720 }
+                          size: { type: integer, example: 1730 }
+                          format: { type: string, example: webp }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ================= 后台：概览 =================
+  /admin/stats:
+    get:
+      tags: [后台-概览]
+      summary: 数据概览
+      description: |
+        `resolvedRate = resolved / (open + resolved)`，排除待审核/驳回/下架，
+        避免还没进入正常流转的帖子拉低真实比例。`trend` 是近 30 天每日发布量。
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Stats' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/audit-logs:
+    get:
+      tags: [后台-概览]
+      summary: 操作日志
+      parameters:
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: pageSize, schema: { type: integer, maximum: 100, default: 20 } }
+        - { in: query, name: action, schema: { type: string, example: item.offline } }
+        - { in: query, name: targetType, schema: { type: string, enum: [item, user, report, category, whitelist] } }
+      responses:
+        '200':
+          description: 成功（`admin` 为 null 表示系统任务）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          list:
+                            type: array
+                            items: { $ref: '#/components/schemas/AuditLog' }
+                          pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ================= 后台：内容 =================
+  /admin/items:
+    get:
+      tags: [后台-内容]
+      summary: 帖子列表（含全部状态）
+      description: 比前台多返回联系方式、作者学号、驳回原因与举报数。
+      parameters:
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: pageSize, schema: { type: integer, maximum: 100, default: 20 } }
+        - { in: query, name: status, schema: { type: string, enum: [pending, open, resolved, rejected, offline] } }
+        - { in: query, name: type, schema: { type: string, enum: [lost, found] } }
+        - { in: query, name: keyword, schema: { type: string, maxLength: 50 }, description: 标题/描述/地点/学号/姓名 }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          list:
+                            type: array
+                            items: { $ref: '#/components/schemas/AdminItem' }
+                          pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/items/batch:
+    post:
+      tags: [后台-内容]
+      summary: 批量操作
+      description: |
+        逐条执行，单条失败不影响其他条。`reject` 必须提供 reason。
+        返回成功/失败条数与失败明细。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, ids]
+              properties:
+                action: { type: string, enum: [approve, reject, offline, restore, delete] }
+                ids: { type: array, minItems: 1, maxItems: 100, items: { type: integer } }
+                reason: { type: string, minLength: 2, maxLength: 200, description: action=reject 时必填 }
+      responses:
+        '200':
+          description: 处理完成
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          action: { type: string }
+                          requested: { type: integer }
+                          succeeded: { type: integer }
+                          failed: { type: integer }
+                          failedItems:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                id: { type: integer }
+                                message: { type: string }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/items/{id}/approve:
+    post:
+      tags: [后台-内容]
+      summary: 审核通过（pending/rejected → open）
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /admin/items/{id}/reject:
+    post:
+      tags: [后台-内容]
+      summary: 驳回（必须填原因）
+      description: 允许从 pending / open / resolved 发起。驳回后作者可编辑再提交。
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 2, maxLength: 200, example: 图片与描述不符 }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /admin/items/{id}/offline:
+    post:
+      tags: [后台-内容]
+      summary: 下架
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /admin/items/{id}/restore:
+    post:
+      tags: [后台-内容]
+      summary: 恢复（offline/rejected → open）
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /admin/items/{id}:
+    delete:
+      tags: [后台-内容]
+      summary: 删除任意帖子
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/items/{id}/matches:
+    get:
+      tags: [后台-内容]
+      summary: 获取失物匹配建议
+      description: 仅管理员可访问。系统按相反类型、区域、分类、名称/特征、地点和发生时间计算建议分数；联系方式和内部备注只出现在管理员 DTO。建议不会自动改变失物状态。
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer, minimum: 1 } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+        - { in: query, name: minScore, schema: { type: integer, minimum: 0, maximum: 100, default: 20 } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/items/{id}/matches/{matchId}/confirm:
+    post:
+      tags: [后台-内容]
+      summary: 确认匹配建议
+      description: 仅 suggested 状态可确认；并发重复操作返回 409。
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer, minimum: 1 } }
+        - { in: path, name: matchId, required: true, schema: { type: integer, minimum: 1 } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { note: { type: string, maxLength: 500 } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /admin/items/{id}/matches/{matchId}/ignore:
+    post:
+      tags: [后台-内容]
+      summary: 忽略匹配建议
+      description: 仅 suggested 状态可忽略；并发重复操作返回 409。
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer, minimum: 1 } }
+        - { in: path, name: matchId, required: true, schema: { type: integer, minimum: 1 } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { note: { type: string, maxLength: 500 } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /admin/items/{id}/matches/manual:
+    post:
+      tags: [后台-内容]
+      summary: 手动关联两条相反类型失物记录
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer, minimum: 1 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: targetItemId 与 targetItemNo 至少提供一个。
+              properties:
+                targetItemId: { type: integer, minimum: 1 }
+                targetItemNo: { type: string, maxLength: 40 }
+                note: { type: string, maxLength: 500 }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ================= 后台：用户 =================
+  /admin/users:
+    get:
+      tags: [后台-用户]
+      summary: 用户列表
+      parameters:
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: pageSize, schema: { type: integer, maximum: 100, default: 20 } }
+        - { in: query, name: status, schema: { type: string, enum: [active, banned] } }
+        - { in: query, name: keyword, schema: { type: string, maxLength: 50 }, description: 学号或姓名 }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          list:
+                            type: array
+                            items: { $ref: '#/components/schemas/AdminUser' }
+                          pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/users/{id}/status:
+    patch:
+      tags: [后台-用户]
+      summary: 禁用 / 启用账号
+      description: 不能修改自己的状态，也不能修改其他管理员的状态。
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [active, banned] }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/users/{id}/reset-password:
+    post:
+      tags: [后台-用户]
+      summary: 重置密码
+      description: |
+        返回一次性临时密码（只显示这一次，库里只存哈希，审计日志不记录明文）。
+        不能重置其他管理员的密码。
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer } }
+      responses:
+        '200':
+          description: 重置成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          studentNo: { type: string }
+                          name: { type: string }
+                          tempPassword: { type: string, description: 一次性临时密码 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/users/{id}/items:
+    get:
+      tags: [后台-用户]
+      summary: 某个用户的发帖记录
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer } }
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: pageSize, schema: { type: integer, maximum: 100, default: 20 } }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          user:
+                            type: object
+                            properties:
+                              id: { type: integer }
+                              studentNo: { type: string }
+                              name: { type: string }
+                              status: { type: string }
+                          list:
+                            type: array
+                            items: { $ref: '#/components/schemas/ItemSummary' }
+                          pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ================= 后台：举报 =================
+  /admin/reports:
+    get:
+      tags: [后台-举报]
+      summary: 举报列表
+      parameters:
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: pageSize, schema: { type: integer, maximum: 100, default: 20 } }
+        - { in: query, name: status, schema: { type: string, enum: [pending, handled] } }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          list:
+                            type: array
+                            items: { $ref: '#/components/schemas/Report' }
+                          pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/reports/{id}/handle:
+    post:
+      tags: [后台-举报]
+      summary: 处理举报
+      description: offline = 下架被举报帖子并把举报标记为已处理；ignore = 只标记举报。重复处理返回 409。
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: { type: string, enum: [offline, ignore] }
+                note: { type: string, maxLength: 200 }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ================= 后台：分类 =================
+  /admin/categories:
+    get:
+      tags: [后台-分类]
+      summary: 分类列表（含停用项与帖子数）
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/AdminCategory' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+    post:
+      tags: [后台-分类]
+      summary: 新建分类
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 30 }
+                sortOrder: { type: integer, minimum: 0, default: 0 }
+                enabled: { type: boolean, default: true }
+      responses:
+        '201': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /admin/categories/{id}:
+    patch:
+      tags: [后台-分类]
+      summary: 更新分类
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, minLength: 1, maxLength: 30 }
+                sortOrder: { type: integer, minimum: 0 }
+                enabled: { type: boolean }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+    delete:
+      tags: [后台-分类]
+      summary: 删除分类
+      description: 分类下还有帖子时拒绝删除（409），提示先迁移。
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: integer } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ================= 后台：学号名单 =================
+  /admin/whitelist:
+    get:
+      tags: [后台-名单]
+      summary: 名单列表
+      parameters:
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: pageSize, schema: { type: integer, maximum: 100, default: 20 } }
+        - { in: query, name: keyword, schema: { type: string, maxLength: 50 } }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          list:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                id: { type: integer }
+                                studentNo: { type: string }
+                                name: { type: string }
+                          pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/whitelist/preview:
+    post:
+      tags: [后台-名单]
+      summary: 预览 CSV（不写库）
+      description: |
+        CSV 每行「学号,姓名」，可带表头。支持 UTF-8 与 GBK（Excel 默认导出）。
+        每行会被标记为：`new` 可导入、`duplicate-in-file` 文件内重复、
+        `duplicate-existing` 名单已存在、`invalid` 格式错误。
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '200':
+          description: 解析完成
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          rows:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                lineNo: { type: integer }
+                                studentNo: { type: string }
+                                name: { type: string }
+                                status: { type: string, enum: [new, duplicate-in-file, duplicate-existing, invalid] }
+                                reason: { type: string }
+                          summary:
+                            type: object
+                            properties:
+                              total: { type: integer }
+                              importable: { type: integer }
+                              duplicateInFile: { type: integer }
+                              duplicateExisting: { type: integer }
+                              invalid: { type: integer }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/whitelist/import:
+    post:
+      tags: [后台-名单]
+      summary: 确认导入 CSV
+      description: 服务端会重新解析与校验（不信任前端预览结果），重复项自动跳过。
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '200':
+          description: 导入完成
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          total: { type: integer }
+                          imported: { type: integer }
+                          skipped: { type: integer }
+                          duplicateInFile: { type: integer }
+                          duplicateExisting: { type: integer }
+                          invalid: { type: integer }
+                          invalidRows:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                lineNo: { type: integer }
+                                studentNo: { type: string }
+                                reason: { type: string }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ================= 运维 =================
+  /health:
+    get:
+      tags: [运维]
+      summary: 健康检查
+      description: 同时探一次数据库，`db=up` 表示连接正常。用于容器健康检查与监控探活。
+      security: []
+      responses:
+        '200':
+          description: 服务正常
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          status: { type: string, example: ok }
+                          db: { type: string, example: up }
+                          uptime: { type: integer, example: 123 }
+                          time: { type: string, format: date-time }
+        '503':
+          description: 数据库不可用
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  responses:
+    Success:
+      description: 操作成功
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    ValidationError:
+      description: 参数校验失败
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Unauthorized:
+      description: 未登录或 token 失效
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Forbidden:
+      description: 无权限（含账号被禁用、非管理员访问后台）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Conflict:
+      description: 状态冲突或资源重复
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    TooManyRequests:
+      description: 触发限流
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: 建议等待秒数
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  schemas:
+    Envelope:
+      type: object
+      properties:
+        code: { type: integer, example: 0 }
+        message: { type: string, example: ok }
+        data: { nullable: true }
+
+    ErrorEnvelope:
+      type: object
+      properties:
+        code: { type: integer, example: 40001 }
+        message: { type: string, example: 请求参数校验失败 }
+        data:
+          nullable: true
+          description: 校验失败时为 `[{ field, message }]`
+
+    Pagination:
+      type: object
+      properties:
+        page: { type: integer, example: 1 }
+        pageSize: { type: integer, example: 12 }
+        total: { type: integer, example: 37 }
+        totalPages: { type: integer, example: 4 }
+
+    UserPublic:
+      type: object
+      properties:
+        id: { type: integer }
+        studentNo: { type: string }
+        name: { type: string }
+        role: { type: string, enum: [student, admin] }
+        status: { type: string, enum: [active, banned] }
+        createdAt: { type: string, format: date-time }
+        lastLoginAt: { type: string, format: date-time, nullable: true }
+
+    AdminUser:
+      allOf:
+        - $ref: '#/components/schemas/UserPublic'
+        - type: object
+          properties:
+            _count:
+              type: object
+              properties:
+                items: { type: integer }
+
+    ItemSummary:
+      type: object
+      description: 列表项（无联系方式）
+      properties:
+        id: { type: integer }
+        type: { type: string, enum: [lost, found] }
+        title: { type: string }
+        description: { type: string }
+        location: { type: string }
+        happenedAt: { type: string, format: date-time }
+        status: { type: string, enum: [pending, open, resolved, rejected, offline] }
+        viewCount: { type: integer }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        resolvedAt: { type: string, format: date-time, nullable: true }
+        hasContact: { type: boolean }
+        category:
+          type: object
+          properties:
+            id: { type: integer }
+            name: { type: string }
+        user:
+          type: object
+          description: 非本人时 name 已脱敏（王**）
+          properties:
+            id: { type: integer }
+            name: { type: string, example: 王** }
+        images:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: integer }
+              url: { type: string }
+              sortOrder: { type: integer }
+
+    ItemDetail:
+      allOf:
+        - $ref: '#/components/schemas/ItemSummary'
+        - type: object
+          description: 已登录时才有 contactType / contactValue；作者本人与管理员才有 rejectReason
+          properties:
+            contactType: { type: string, enum: [wechat, qq, phone, other] }
+            contactValue: { type: string }
+            rejectReason: { type: string, nullable: true }
+
+    AdminItem:
+      allOf:
+        - $ref: '#/components/schemas/ItemDetail'
+        - type: object
+          properties:
+            _count:
+              type: object
+              properties:
+                reports: { type: integer }
+            user:
+              type: object
+              properties:
+                id: { type: integer }
+                studentNo: { type: string }
+                name: { type: string }
+                status: { type: string }
+
+    Category:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        sortOrder: { type: integer }
+        enabled: { type: boolean }
+
+    AdminCategory:
+      allOf:
+        - $ref: '#/components/schemas/Category'
+        - type: object
+          properties:
+            _count:
+              type: object
+              properties:
+                items: { type: integer }
+
+    Report:
+      type: object
+      properties:
+        id: { type: integer }
+        reason: { type: string }
+        status: { type: string, enum: [pending, handled] }
+        createdAt: { type: string, format: date-time }
+        item:
+          type: object
+          properties:
+            id: { type: integer }
+            title: { type: string }
+            status: { type: string }
+            type: { type: string }
+            user:
+              type: object
+              properties:
+                id: { type: integer }
+                studentNo: { type: string }
+                name: { type: string }
+        reporter:
+          type: object
+          properties:
+            id: { type: integer }
+            studentNo: { type: string }
+            name: { type: string }
+        handler:
+          type: object
+          nullable: true
+          properties:
+            id: { type: integer }
+            name: { type: string }
+
+    AuditLog:
+      type: object
+      properties:
+        id: { type: integer }
+        action: { type: string, example: item.offline }
+        targetType: { type: string, example: item }
+        targetId: { type: integer, nullable: true }
+        detail:
+          type: object
+          nullable: true
+          description: 结构化明细（前后状态、理由等）
+        createdAt: { type: string, format: date-time }
+        admin:
+          type: object
+          nullable: true
+          description: 为 null 表示系统任务（如 90 天自动归档）
+          properties:
+            id: { type: integer }
+            name: { type: string }
+            studentNo: { type: string }
+
+    Stats:
+      type: object
+      properties:
+        totalItems: { type: integer }
+        pendingItems: { type: integer }
+        weeklyNew: { type: integer, description: 最近 7 天新增 }
+        openItems: { type: integer }
+        resolvedItems: { type: integer }
+        resolvedRate: { type: number, example: 0.5, description: resolved / (open + resolved) }
+        totalUsers: { type: integer }
+        bannedUsers: { type: integer }
+        pendingReports: { type: integer }
+        trend:
+          type: array
+          description: 近 30 天每日发布量
+          items:
+            type: object
+            properties:
+              date: { type: string, example: '2026-10-23' }
+              count: { type: integer }

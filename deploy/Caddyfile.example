@@ -1,0 +1,7 @@
+# 将 wiki.example.edu.cn 换成正式域名后，复制到 /etc/caddy/Caddyfile。
+# Caddy 会自动申请并续期 HTTPS 证书。
+
+wiki.example.edu.cn {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8080
+}

@@ -1,0 +1,21 @@
+# 构建镜像时不要把本地产物带进去
+node_modules
+**/node_modules
+**/dist
+**/coverage
+**/.env
+**/.env.*
+
+backend/uploads
+backend/uploads-test
+backend/backups
+backups
+
+.git
+.github
+.vscode
+.idea
+
+docs/screenshots
+*.log
+.tmp-*

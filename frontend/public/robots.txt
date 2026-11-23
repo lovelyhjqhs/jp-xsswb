@@ -1,0 +1,10 @@
+User-agent: *
+Allow: /
+Disallow: /admin/
+Disallow: /api/
+Disallow: /mailbox/query
+Disallow: /canteen/feedback
+Disallow: /lost-found/report
+Disallow: /lost-found/found
+Disallow: /lost-found/inquiry
+Disallow: /*?*
