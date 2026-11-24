@@ -35,3 +35,6 @@ pnpm-debug.log*
 .idea/
 .DS_Store
 Thumbs.db
+
+# 一次性部署临时文件
+.deploy_tmp/
