@@ -16,7 +16,7 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debia
 COPY package.json package-lock.json ./
 COPY backend/package.json ./backend/package.json
 COPY frontend/package.json ./frontend/package.json
-RUN npm ci --no-audit --no-fund
+RUN npm ci --registry=https://registry.npmmirror.com --no-audit --no-fund
 
 # 生成客户端（.prisma/client 里包含查询引擎）
 COPY backend/prisma ./backend/prisma
@@ -44,7 +44,7 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debia
 COPY package.json package-lock.json ./
 COPY backend/package.json ./backend/package.json
 COPY frontend/package.json ./frontend/package.json
-RUN PRISMA_SKIP_POSTINSTALL_GENERATE=true npm ci --no-audit --no-fund \
+RUN PRISMA_SKIP_POSTINSTALL_GENERATE=true npm ci --registry=https://registry.npmmirror.com --no-audit --no-fund \
  && rm -rf \
       # ---- Prisma CLI 工具链（运行时只需要 .prisma/client 里的查询引擎）----
       node_modules/prisma \

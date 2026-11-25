@@ -8,7 +8,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 COPY frontend/package.json ./frontend/package.json
 COPY backend/package.json ./backend/package.json
-RUN npm ci --no-audit --no-fund
+RUN npm ci --registry=https://registry.npmmirror.com --no-audit --no-fund
 
 COPY frontend ./frontend
 RUN npm --workspace frontend run build
